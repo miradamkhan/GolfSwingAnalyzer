@@ -5,6 +5,9 @@ import os
 import numpy as np
 from PIL import Image
 import io
+import base64
+import mimetypes
+import pathlib
 
 from swing_analyzer.modules.pose_tracker import PoseTracker
 from swing_analyzer.modules.swing_analyzer import SwingAnalyzer, SwingPhase
@@ -21,6 +24,7 @@ def process_uploaded_video(video_file, comparison_file=None):
         
     Returns:
         output_video_path: Path to processed video
+        comparison_video_path: Path to side-by-side comparison (if comparison provided)
         report_path: Path to generated report
         report_image: Generated report image
     """
@@ -40,6 +44,7 @@ def process_uploaded_video(video_file, comparison_file=None):
     
     # Set output paths
     output_video_path = os.path.join(temp_dir, "output_video.mp4")
+    side_by_side_path = os.path.join(temp_dir, "side_by_side.mp4") if comparison_path else None
     
     # Initialize components
     pose_tracker = PoseTracker()
@@ -162,7 +167,136 @@ def process_uploaded_video(video_file, comparison_file=None):
     
     status_text.text("Processing complete!")
     
-    return output_video_path, report_path, report_image
+    # If we have a comparison video, create a side-by-side version too
+    if comparison_path and pro_pose_frames:
+        # Create video writer for side-by-side comparison
+        side_by_side_writer = cv2.VideoWriter(side_by_side_path, fourcc, fps, (width*2, height))
+        
+        # Reopen the input video
+        input_video = cv2.VideoCapture(input_path)
+        comp_video = cv2.VideoCapture(comparison_path)
+        
+        # Process frames for side-by-side
+        while True:
+            ret1, frame1 = input_video.read()
+            ret2, frame2 = comp_video.read()
+            
+            if not ret1 or not ret2:
+                break
+                
+            # Resize frames if they're different sizes
+            frame2 = cv2.resize(frame2, (frame1.shape[1], frame1.shape[0]))
+                
+            # Combine frames side by side
+            combined = np.hstack((frame1, frame2))
+            
+            # Add labels
+            cv2.putText(combined, "Your Swing", (int(width * 0.1), 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            cv2.putText(combined, "Pro Reference", (int(width * 1.1), 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            
+            # Write to video
+            side_by_side_writer.write(combined)
+            
+        # Release resources
+        input_video.release()
+        comp_video.release()
+        side_by_side_writer.release()
+    
+    return output_video_path, side_by_side_path, report_path, report_image
+
+def create_video_preview(video_path, preview_path=None, frames_to_extract=10):
+    """
+    Create a video preview GIF from the first few frames of a video.
+    
+    Args:
+        video_path: Path to the video file
+        preview_path: Path to save the preview image (if None, a temp path is created)
+        frames_to_extract: Number of frames to extract for the preview
+        
+    Returns:
+        preview_path: Path to the created preview image
+    """
+    if preview_path is None:
+        preview_path = os.path.splitext(video_path)[0] + "_preview.gif"
+    
+    # Open the video
+    video = cv2.VideoCapture(video_path)
+    
+    # Get video properties
+    width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Calculate frames to skip to get a representative sample
+    frame_skip = max(1, total_frames // frames_to_extract)
+    
+    # Collect frames
+    frames = []
+    for i in range(0, total_frames, frame_skip):
+        video.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = video.read()
+        if ret:
+            # Resize frame to make GIF smaller
+            frame = cv2.resize(frame, (width // 2, height // 2))
+            # Convert to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(frame_rgb))
+            
+        if len(frames) >= frames_to_extract:
+            break
+    
+    # Save as GIF
+    if frames:
+        frames[0].save(
+            preview_path,
+            save_all=True,
+            append_images=frames[1:],
+            optimize=True,
+            duration=200,  # milliseconds per frame
+            loop=0
+        )
+    
+    # Release video
+    video.release()
+    
+    return preview_path
+
+def display_video_player(video_path, width=700):
+    """
+    Display a video player in Streamlit with a fallback to download if playback fails.
+    
+    Args:
+        video_path: Path to the video file
+        width: Width of the video player
+    """
+    # Create a preview GIF
+    preview_path = create_video_preview(video_path)
+    
+    # Get the video file size in MB
+    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    
+    # Display the video using Streamlit's native video player
+    video_file = open(video_path, 'rb')
+    video_bytes = video_file.read()
+    
+    st.video(video_bytes)
+    
+    # Display a preview GIF as a fallback
+    st.markdown("### Video Preview (GIF)")
+    st.markdown("If the video above doesn't play correctly, you can view this animated preview or download the video.")
+    st.image(preview_path, width=width)
+    
+    # Add download button
+    st.download_button(
+        label=f"Download Video ({file_size_mb:.1f} MB)",
+        data=video_bytes,
+        file_name=os.path.basename(video_path),
+        mime="video/mp4"
+    )
+    
+    video_file.close()
 
 def main():
     st.set_page_config(
@@ -192,7 +326,7 @@ def main():
         # Process button
         if st.button("Analyze Swing"):
             with st.spinner("Processing video..."):
-                output_video, report_path, report_image = process_uploaded_video(
+                output_video, side_by_side, report_path, report_image = process_uploaded_video(
                     video_file, 
                     comparison_file
                 )
@@ -201,46 +335,58 @@ def main():
                 if output_video and os.path.exists(output_video):
                     st.subheader("Analysis Results")
                     
-                    # Display the processed video
-                    st.video(output_video)
+                    # Create tabs for different views
+                    result_tabs = st.tabs(["Analyzed Swing", "Side-by-Side Comparison" if side_by_side else "Detailed Report", "Summary Report"])
                     
-                    # Display report image if available
-                    if report_image is not None:
-                        st.subheader("Swing Analysis Summary")
-                        
-                        # Convert OpenCV image to format Streamlit can display
-                        report_image_rgb = cv2.cvtColor(report_image, cv2.COLOR_BGR2RGB)
-                        pil_image = Image.fromarray(report_image_rgb)
-                        
-                        # Display image
-                        st.image(pil_image, use_column_width=True)
+                    with result_tabs[0]:
+                        # Display the processed video using the enhanced video player
+                        st.markdown("### Your Swing with Analysis")
+                        display_video_player(output_video)
                     
-                    # Display text report if available
-                    if report_path and os.path.exists(report_path):
-                        st.subheader("Detailed Analysis Report")
-                        
-                        with open(report_path, 'r') as f:
-                            report_text = f.read()
+                    with result_tabs[1]:
+                        if side_by_side and os.path.exists(side_by_side):
+                            st.markdown("### Your Swing vs Pro Reference")
+                            display_video_player(side_by_side, width=900)
+                        else:
+                            # Display text report if available
+                            if report_path and os.path.exists(report_path):
+                                st.markdown("### Detailed Analysis Report")
+                                
+                                with open(report_path, 'r') as f:
+                                    report_text = f.read()
+                                    
+                                st.text_area("Full Report", report_text, height=400)
+                    
+                    with result_tabs[2 if side_by_side else 1]:
+                        # Display report image if available
+                        if report_image is not None:
+                            st.markdown("### Swing Analysis Summary")
                             
-                        st.text_area("Full Report", report_text, height=400)
-                        
-                        # Add download button for report
-                        with open(report_path, "rb") as file:
-                            st.download_button(
-                                label="Download Analysis Report",
-                                data=file,
-                                file_name="golf_swing_analysis_report.txt",
-                                mime="text/plain"
-                            )
+                            # Convert OpenCV image to format Streamlit can display
+                            report_image_rgb = cv2.cvtColor(report_image, cv2.COLOR_BGR2RGB)
+                            pil_image = Image.fromarray(report_image_rgb)
+                            
+                            # Display image
+                            st.image(pil_image, use_column_width=True)
                     
-                    # Add download button for video
-                    with open(output_video, "rb") as file:
-                        st.download_button(
-                            label="Download Analyzed Video",
-                            data=file,
-                            file_name="golf_swing_analysis.mp4",
-                            mime="video/mp4"
-                        )
+                    # Add download section for all results
+                    st.subheader("Download Results")
+                    col1, col2 = st.columns(2)
+                    
+                    # Only show report download button since video downloads are now included with each video
+                    if report_path and os.path.exists(report_path):
+                        with col1:
+                            with open(report_path, "rb") as file:
+                                st.download_button(
+                                    label="Download Analysis Report",
+                                    data=file,
+                                    file_name="golf_swing_analysis_report.txt",
+                                    mime="text/plain"
+                                )
+                    
+                    # Add a button to save all results to a zip file for easy downloading
+                    with col2:
+                        st.info("Individual video download options are available in each tab above.")
     
     # Additional information
     with st.expander("How to use this tool"):
